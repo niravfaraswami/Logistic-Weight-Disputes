@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.git/
+.gitignore
+sample_*.csv
+DTDC_Reconciliation_App_Spec.md
