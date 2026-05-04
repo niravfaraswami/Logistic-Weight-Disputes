@@ -382,6 +382,34 @@ def build_xlsx(overcharged: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def build_missing_skus_xlsx(missing_combos: list[str]) -> bytes:
+    """XLSX template for missing SKU combos — fill in L/B/H/Weight and paste back into master."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Missing SKUs"
+
+    headers = ["SKU_Combo", "L (cm)", "B (cm)", "H (cm)", "Weight (kg)"]
+    header_fill = PatternFill("solid", fgColor="C00000")
+    header_font = Font(bold=True, color="FFFFFF")
+
+    for col, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for i, combo in enumerate(sorted(missing_combos), start=2):
+        ws.cell(row=i, column=1, value=combo)
+
+    widths = [50, 12, 12, 12, 14]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -507,7 +535,14 @@ if run:
             .tolist()
         )
         if new_combos:
-            st.markdown("**SKU combos to add to master:**")
+            st.markdown(f"**SKU combos to add to master ({len(new_combos)}):**")
+            missing_xlsx = build_missing_skus_xlsx(new_combos)
+            st.download_button(
+                "Download Missing SKUs XLSX",
+                data=missing_xlsx,
+                file_name="Missing_SKU_Dimensions.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
             for c in sorted(new_combos):
                 st.code(c, language=None)
 else:
