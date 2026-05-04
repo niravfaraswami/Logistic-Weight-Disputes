@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import io
 import math
+import os
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +20,47 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="DTDC Reconciliation", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# Persistent storage
+# ---------------------------------------------------------------------------
+# DATA_DIR points to a Railway Volume mount in production (e.g. /data) and
+# defaults to ./data for local dev. Files persist across reconciliation runs.
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
+SKU_MASTER_PATH = DATA_DIR / "sku_master.csv"
+ZONE_RATES_PATH = DATA_DIR / "zone_rates.csv"
+
+
+def ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_saved_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def save_csv(df: pd.DataFrame, path: Path) -> None:
+    ensure_data_dir()
+    df.to_csv(path, index=False)
+
+
+def file_status(path: Path) -> str:
+    if not path.exists():
+        return "no saved version"
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    try:
+        rows = len(pd.read_csv(path))
+    except Exception:
+        rows = "?"
+    return f"{rows} rows · saved {mtime:%Y-%m-%d %H:%M}"
+
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +149,39 @@ def build_order_sku_map(df_orders: pd.DataFrame) -> dict[str, list[str]]:
         if items:
             order_sku_map[order_id] = items
     return order_sku_map
+
+
+def merge_sku_master(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    """Merge an incoming SKU dimensions file into the existing master.
+
+    Dedup by normalized SKU combo key (the first column). Latest upload wins —
+    this lets users correct dimensions for an existing combo by re-uploading.
+    Returns a new DataFrame; caller persists it.
+    """
+    if incoming is None or incoming.empty:
+        return existing.copy() if not existing.empty else pd.DataFrame()
+    if existing is None or existing.empty:
+        return incoming.copy()
+
+    # Align columns: union, preserving existing order then any new ones
+    cols = list(existing.columns)
+    for c in incoming.columns:
+        if c not in cols:
+            cols.append(c)
+    existing = existing.reindex(columns=cols)
+    incoming = incoming.reindex(columns=cols)
+
+    key_col = cols[0]
+    incoming_keys = {
+        normalize_sku_combo(v) for v in incoming[key_col].astype(str).tolist() if normalize_sku_combo(v)
+    }
+
+    def _key(v) -> str:
+        return normalize_sku_combo(v)
+
+    keep_existing = existing[~existing[key_col].apply(_key).isin(incoming_keys)]
+    merged = pd.concat([keep_existing, incoming], ignore_index=True)
+    return merged
 
 
 def build_sku_lookup(df_sku: pd.DataFrame) -> dict[str, dict]:
@@ -425,18 +502,29 @@ st.title("DTDC Invoice Reconciliation")
 st.caption("Upload monthly files and generate a weight-dispute report for GutBasket Foods.")
 
 with st.sidebar:
-    st.header("Files")
+    st.header("Required this month")
     invoice_file = st.file_uploader("DTDC Invoice (CSV/XLSX)", type=["csv", "xlsx", "xls"], key="inv")
     orders_file = st.file_uploader("Shopify Orders Export (CSV)", type=["csv", "xlsx"], key="ord")
+
+    st.header("Saved master files")
+    st.caption("These persist between runs. Upload only when you have updates.")
+    st.markdown(f"**SKU Dimensions** — {file_status(SKU_MASTER_PATH)}")
     sku_files = st.file_uploader(
-        "SKU Dimensions Master (CSV) — multiple allowed",
+        "Upload to merge into SKU master (multiple allowed)",
         type=["csv", "xlsx"],
         accept_multiple_files=True,
         key="sku",
     )
-    zones_file = st.file_uploader("Zone Rates (CSV) — optional fallback", type=["csv", "xlsx"], key="zone")
+    st.markdown(f"**Zone Rates** — {file_status(ZONE_RATES_PATH)}")
+    zones_file = st.file_uploader(
+        "Upload to replace Zone Rates",
+        type=["csv", "xlsx"],
+        key="zone",
+    )
+
+    st.header("Optional")
     booked_file = st.file_uploader(
-        "Booked.csv (optional, only if invoice has no ZCUST_REF)",
+        "Booked.csv (only if invoice has no ZCUST_REF)",
         type=["csv", "xlsx"],
         key="bkd",
     )
@@ -444,41 +532,119 @@ with st.sidebar:
 
 # Validation panel
 status_cols = st.columns(4)
-file_specs = [
-    ("Invoice", invoice_file, ["CONSIGNMENT_NO", "CHARGED_WEIGHT", "BASIC_FREIGHT"]),
-    ("Orders", orders_file, ["Name", "Lineitem sku", "Lineitem quantity"]),
-    ("SKU Master", sku_files[0] if sku_files else None, ["L (cm)", "B (cm)", "H (cm)"]),
-    ("Zone Rates", zones_file, ["Zone", "Rate"]),
-]
 
-for col, (label, f, required) in zip(status_cols, file_specs):
-    with col:
-        if f is None:
-            st.info(f"**{label}**\nNot uploaded")
-        else:
-            try:
-                df = read_tabular(f)
-                ok, missing = column_check(df, required)
-                if ok:
-                    st.success(f"**{label}** ✓\n{len(df)} rows")
-                else:
-                    st.warning(f"**{label}** missing: {missing}")
-            except Exception as e:
-                st.error(f"**{label}** failed: {e}")
+
+def _check_saved(label: str, path: Path, required: list[str]) -> None:
+    if not path.exists():
+        st.error(f"**{label}** ✗\nNo upload, no saved version")
+        return
+    df = load_saved_csv(path)
+    ok, missing = column_check(df, required)
+    if ok:
+        st.success(f"**{label}** ✓ (saved)\n{len(df)} rows")
+    else:
+        st.warning(f"**{label}** saved but missing: {missing}")
+
+
+# Invoice
+with status_cols[0]:
+    if invoice_file is None:
+        st.info("**Invoice**\nNot uploaded")
+    else:
+        try:
+            df = read_tabular(invoice_file)
+            ok, missing = column_check(df, ["CONSIGNMENT_NO", "CHARGED_WEIGHT", "BASIC_FREIGHT"])
+            if ok:
+                st.success(f"**Invoice** ✓\n{len(df)} rows")
+            else:
+                st.warning(f"**Invoice** missing: {missing}")
+        except Exception as e:
+            st.error(f"**Invoice** failed: {e}")
+
+# Orders
+with status_cols[1]:
+    if orders_file is None:
+        st.info("**Orders**\nNot uploaded")
+    else:
+        try:
+            df = read_tabular(orders_file)
+            ok, missing = column_check(df, ["Name", "Lineitem sku", "Lineitem quantity"])
+            if ok:
+                st.success(f"**Orders** ✓\n{len(df)} rows")
+            else:
+                st.warning(f"**Orders** missing: {missing}")
+        except Exception as e:
+            st.error(f"**Orders** failed: {e}")
+
+# SKU Master — uploaded preview, or saved
+with status_cols[2]:
+    if sku_files:
+        try:
+            preview = pd.concat([read_tabular(f) for f in sku_files], ignore_index=True)
+            ok, missing = column_check(preview, ["L (cm)", "B (cm)", "H (cm)"])
+            if ok:
+                existing = load_saved_csv(SKU_MASTER_PATH)
+                merged_preview = merge_sku_master(existing, preview)
+                st.success(
+                    f"**SKU Master** ✓ (will merge)\n"
+                    f"+{len(preview)} new → {len(merged_preview)} total"
+                )
+            else:
+                st.warning(f"**SKU Master** missing: {missing}")
+        except Exception as e:
+            st.error(f"**SKU Master** failed: {e}")
+    else:
+        _check_saved("SKU Master", SKU_MASTER_PATH, ["L (cm)", "B (cm)", "H (cm)"])
+
+# Zone Rates
+with status_cols[3]:
+    if zones_file is not None:
+        try:
+            df = read_tabular(zones_file)
+            ok, missing = column_check(df, ["Zone", "Rate"])
+            if ok:
+                st.success(f"**Zone Rates** ✓ (will replace)\n{len(df)} rows")
+            else:
+                st.warning(f"**Zone Rates** missing: {missing}")
+        except Exception as e:
+            st.error(f"**Zone Rates** failed: {e}")
+    else:
+        _check_saved("Zone Rates", ZONE_RATES_PATH, ["Zone", "Rate"])
 
 st.divider()
 
 if run:
-    if invoice_file is None or orders_file is None or not sku_files:
-        st.error("Invoice, Orders, and SKU Dimensions are required.")
+    if invoice_file is None or orders_file is None:
+        st.error("Invoice and Orders are required.")
+        st.stop()
+    if not sku_files and not SKU_MASTER_PATH.exists():
+        st.error("No SKU Dimensions master saved yet. Upload one to start.")
         st.stop()
 
     try:
         with st.spinner("Reading files..."):
             df_invoice = read_tabular(invoice_file)
             df_orders = read_tabular(orders_file)
-            df_sku = pd.concat([read_tabular(f) for f in sku_files], ignore_index=True)
             df_booked = read_tabular(booked_file) if booked_file else pd.DataFrame()
+
+            # SKU master: merge incoming uploads into saved master, persist
+            saved_sku = load_saved_csv(SKU_MASTER_PATH)
+            if sku_files:
+                incoming_sku = pd.concat([read_tabular(f) for f in sku_files], ignore_index=True)
+                df_sku = merge_sku_master(saved_sku, incoming_sku)
+                save_csv(df_sku, SKU_MASTER_PATH)
+                st.info(
+                    f"SKU master updated: {len(saved_sku)} → {len(df_sku)} rows "
+                    f"(+{len(df_sku) - len(saved_sku)} new/updated)"
+                )
+            else:
+                df_sku = saved_sku
+
+            # Zone rates: replace saved if uploaded
+            if zones_file is not None:
+                df_zones = read_tabular(zones_file)
+                save_csv(df_zones, ZONE_RATES_PATH)
+                st.info(f"Zone rates saved: {len(df_zones)} rows")
 
         with st.spinner("Reconciling..."):
             order_map = build_order_sku_map(df_orders)
